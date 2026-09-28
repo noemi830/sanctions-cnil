@@ -1,0 +1,50 @@
+name: Veille sanctions CNIL
+
+on:
+  schedule:
+    - cron: "0 6 * * 1-5"   # du lundi au vendredi à 6h UTC (8h à Paris en été, 7h en hiver)
+  workflow_dispatch:         # bouton "Run workflow" pour lancer à la main
+  push:
+    paths: ["Sanctions_CNIL.xlsx"]   # si vous redéposez l'Excel corrigé, la page se met à jour
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: veille-cnil
+  cancel-in-progress: false
+
+jobs:
+  veille:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploiement.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r requirements.txt
+
+      - name: Chercher les nouvelles sanctions sur cnil.fr
+        run: python veille_cnil.py
+
+      - name: Enregistrer l'Excel s'il a changé
+        run: |
+          git config user.name "veille-cnil"
+          git config user.email "veille-cnil@users.noreply.github.com"
+          git add Sanctions_CNIL.xlsx
+          git diff --cached --quiet || (git commit -m "Nouvelle(s) sanction(s) CNIL" && git push)
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - name: Publier la page
+        id: deploiement
+        uses: actions/deploy-pages@v4
