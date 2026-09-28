@@ -94,31 +94,80 @@ def est_sanction(art):
     return not any(x in art["titre"].lower() for x in TITRES_EXCLUS)
 
 
+TAGS_IGNORES = {"sanction", "particulier", "professionnel"}
+
+
+def _propre(t):
+    return re.sub(r"\s+", " ", (t or "").replace("\u2019", "'")).strip()
+
+
 def details_article(lien):
-    """Va lire la page de l'article pour trouver la référence SAN-xxxx et les articles cités."""
+    """Lit la page de l'article CNIL et en tire, quand c'est possible :
+    - la délibération (référence SAN + date), dans la rubrique « La délibération » en bas d'article ;
+    - les manquements, à partir des intertitres « Un manquement à ... (article X du RGPD) » ;
+    - l'entité (« concernant la société X ») et le montant (« amende de X euros ») ;
+    - les mots clés thématiques que la CNIL attache à l'article (#Cookies, #Prospection...).
+    """
+    infos = dict(ref="", date=None, manquements="", entite="", montant="", mots_cles="", texte="")
     try:
         soup = BeautifulSoup(telecharger(lien), "html.parser")
     except Exception as e:
         print(f"  ! impossible de lire {lien} : {e}")
-        return "", ""
+        return infos
     corps = soup.find("main") or soup
-    texte = corps.get_text(" ", strip=True)
-    refs = sorted(set(re.findall(r"SAN\s?[-–]\s?\d{4}\s?[-–]\s?\d{3}", texte)))
-    refs = [re.sub(r"\s", "", r).replace("–", "-") for r in refs]
-    arts = re.findall(r"articles?\s+((?:\d+(?:\.\d+)*(?:\.[a-z])?(?:,\s*|\s+et\s+)?)+)\s*(du RGPD|de la loi Informatique et Libertés|RGPD|LIL)?", texte, re.I)
-    vus, cites = set(), []
-    for nums, source in arts:
-        src = "LIL" if source and "loi" in source.lower() or source == "LIL" else "RGPD"
-        for n in re.findall(r"\d+(?:\.\d+)*(?:\.[a-z])?", nums):
-            k = f"Art {n} {src}"
-            if k not in vus:
-                vus.add(k)
-                cites.append(k)
-    return " et ".join(f"Délibération {r}" for r in refs), "\n".join(cites)
+    texte = _propre(corps.get_text(" ", strip=True))
+
+    # 1) Délibération(s) : "Délibération SAN-2025-017 du 30 décembre 2025"
+    #    ou "Délibération de la formation restreinte n° SAN – 2026-010 du 21 juillet 2026 concernant la société EXTIA"
+    refs, dates = [], []
+    for m in re.finditer(r"Délibération[^.]{0,80}?(SAN\s*[-–]\s*\d{4}\s*[-–]\s*\d{3})\s*(?:du\s+(\d{1,2}(?:er)?\s+\w+\s+\d{4}))?"
+                         r"(?:\s+concernant\s+(?:la société |l'|le |la |les sociétés )?([^-|]+?))?(?=\s+-\s+Légifrance|\s+Texte|\s+Délibération|$)",
+                         texte):
+        ref = re.sub(r"\s", "", m.group(1)).replace("–", "-")
+        if ref not in refs:
+            refs.append(ref)
+            if m.group(2):
+                dates.append(parse_date(m.group(2)))
+            if m.group(3) and not infos["entite"] and len(m.group(3)) < 80 and not m.group(3).strip().upper().startswith("X"):
+                infos["entite"] = m.group(3).strip()
+    infos["ref"] = " et ".join(f"Délibération {r}" for r in refs)
+    infos["date"] = next((d for d in dates if d), None)
+
+    # 2) Manquements : intertitres "Un manquement à l'obligation de ... (article 6 du RGPD)"
+    lignes, vus = [], set()
+    for h in corps.find_all(["h3", "h4"]):
+        t = _propre(h.get_text(" "))
+        m = re.search(r"^(?:un |des |le |les )?(manquements?.*?)\s*\((?:articles?|art\.)\s+(.+?)\s+(du RGPD|du règlement[^)]*|de la loi[^)]*|LIL)\s*\)\s*$", t, re.I)
+        if not m:
+            continue
+        desc, nums, src = m.group(1), m.group(2), m.group(3)
+        suffixe = " LIL" if "loi" in src.lower() or src == "LIL" else ""
+        ligne = f"Art {nums}{suffixe} ({desc[0].lower() + desc[1:]})"
+        if ligne not in vus:
+            vus.add(ligne)
+            lignes.append(ligne)
+    infos["manquements"] = "\n".join(lignes)
+
+    # 3) Montant : "amende de 3,5 millions d'euros" / "amende administrative d'un montant de 5 000 euros"
+    m = re.search(r"amendes?(?: administratives?)?(?: d'un montant)? de ((?:respectivement )?\d[\d\s.,]*(?:\s*(?:et|,)\s*\d[\d\s.,]*)?\s*(?:millions?|milliards?)?)\s*(?:d'euros|euros|€)", texte, re.I)
+    if m:
+        infos["montant"] = m.group(1).replace("respectivement ", "").strip() + " €"
+
+    # 4) Mots clés : tags thématiques de la CNIL + phrase d'accroche de l'article
+    tags = []
+    for a in corps.find_all("a", href=re.compile(r"/tag/")):
+        t = _propre(a.get_text()).lstrip("#")
+        if t and t.lower() not in TAGS_IGNORES and t not in tags:
+            tags.append(t)
+    infos["mots_cles"] = "\n".join(tags)
+    infos["texte"] = texte
+    if re.search(r"sans qu'il soit[^.]*utile de nommer|ne peut pas divulguer le nom|anonymis", texte, re.I) and not infos["entite"]:
+        infos["entite"] = "Identité de la société non disponible"
+    return infos
 
 
 def entite(titre):
-    m = re.search(r"à l[’']encontre (?:de la société |de l[’']|du |de la |des |de |d[’'])(.+)$", titre, re.I)
+    m = re.search(r"à l[’']encontre (?:de la société |des sociétés |de l[’']|du |de la |des |de |d[’'])(.+)$", titre, re.I)
     return m.group(1).strip() if m else ""
 
 
@@ -211,12 +260,27 @@ def main(dry_run=False):
             ws.cell(1, c)._style = copy(ws.cell(1, 1)._style)
     deja = {str(ws.cell(r, COL_LIEN).value).strip() for r in range(2, ws.max_row + 1) if ws.cell(r, COL_LIEN).value}
 
-    trouves = []
+    trouves, nb_articles = [], 0
     for p in range(NB_PAGES):
         html = telecharger(f"{URL_ACTUS}?page={p}")
-        trouves += [a for a in extraire_articles(html) if est_sanction(a)]
+        arts = extraire_articles(html)
+        nb_articles += len(arts)
+        print(f"Page {p + 1} : {len(arts)} articles lus")
+        trouves += [a for a in arts if est_sanction(a)]
 
-    nouveaux = [a for a in dict((a["lien"], a) for a in trouves).values() if a["lien"] not in deja]
+    # Garde-fou : si aucun article n'est lu, la page de la CNIL a sans doute changé.
+    # On fait échouer le robot (croix rouge + e-mail automatique de GitHub) au lieu de se taire.
+    if nb_articles == 0:
+        sys.exit("ERREUR : aucun article lu sur cnil.fr/fr/actualite. La structure du site a peut-être changé.")
+
+    trouves = list(dict((a["lien"], a) for a in trouves).values())
+    print(f"\nSanctions repérées sur cnil.fr ({len(trouves)}) :")
+    for a in trouves:
+        etat = "déjà dans le tableau" if a["lien"] in deja else "NOUVELLE"
+        print(f"  - [{etat}] {a['titre']}")
+    print()
+
+    nouveaux = [a for a in trouves if a["lien"] not in deja]
     nouveaux.sort(key=lambda a: a["date_pub"] or dt.datetime.min)
     if not nouveaux:
         print("Aucune nouvelle sanction.")
@@ -227,15 +291,20 @@ def main(dry_run=False):
     derniere = max(r for r in range(1, ws.max_row + 1) if ws.cell(r, 1).value not in (None, ""))
     modele = derniere
     for art in nouveaux:
-        ref, articles_cites = details_article(art["lien"])
-        date_decision = parse_date(art["resume"]) or art["date_pub"]
+        d = details_article(art["lien"])
+        date_decision = d["date"] or parse_date(art["resume"]) or art["date_pub"]
+        chapo = art["resume"].rstrip("…. ")
+        m = re.search(re.escape(_propre(chapo)[:60]) + r"[^.]*\.", d["texte"]) if chapo else None
+        if m:
+            chapo = m.group(0)
+        mots = chapo + ("\n" + d["mots_cles"] if d["mots_cles"] else "")
         ligne = [
-            ref or "À compléter",
+            d["ref"] or "À compléter",
             date_decision,
-            f"{art['titre']}\n{art['resume']}",
-            entite(art["titre"]) or "À compléter",
-            (articles_cites + "\n(extraction auto, à vérifier)") if articles_cites else "À compléter",
-            montant(art["titre"], art["resume"]) or "À compléter",
+            mots,
+            entite(art["titre"]) or d["entite"] or "À compléter",
+            d["manquements"] or "À compléter",
+            montant(art["titre"], art["resume"]) or d["montant"] or "À compléter",
             art["lien"],
             dt.datetime.now().replace(microsecond=0),
         ]
